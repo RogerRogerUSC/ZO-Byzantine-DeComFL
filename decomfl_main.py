@@ -153,7 +153,7 @@ def setup_server_and_clients(
     elif args.aggregation == "krum":
         server.register_aggregation_func(byz_agg.krum)
     # Haven't picked a name for our method. 
-    elif args.aggregation == "our":
+    elif args.aggregation == "bys":
         server.register_aggregation_func(bys_estimate.Bayesian_estimate)
     else:
         raise Exception(
