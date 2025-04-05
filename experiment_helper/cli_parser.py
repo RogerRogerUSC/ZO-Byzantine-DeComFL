@@ -110,7 +110,7 @@ class RGESetting(FrozenSetting):
         description="Forward or Central",
     )
     optim: CliImplicitFlag[bool] = Field(
-        default=True,
+        default=False,
         description="Use optimizer or not, when no-optim, update model without torch.optim (SGD only). This can significantly save memory.",
     )
 
@@ -143,8 +143,7 @@ class FederatedLearningSetting(FrozenSetting):
 
 
 class ByzantineSetting(FrozenSetting):
-    # Byzantinem TODO improve options
-    aggregation: Literal["mean", "median", "trim", "krum"] = Field(default="mean")
+    aggregation: Literal["mean", "median", "trim", "krum", "bys"] = Field(default="mean")
     byz_type: str = Field(default="no_byz", validation_alias=AliasChoices("byz-type"))
     num_byz: int = Field(
         default=1,
