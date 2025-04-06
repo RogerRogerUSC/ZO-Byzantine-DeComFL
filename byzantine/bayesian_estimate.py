@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from typing import List, Tuple
 
-def Bayesian_estimate(g: List[List[torch.Tensor]], max_iter: int = 10,tol: float = 1e-3) -> Tuple[torch.Tensor, torch.Tensor, float, List[List[torch.Tensor]], List[List[torch.Tensor]]]:
+def Bayesian_estimate(g: List[List[torch.Tensor]], max_iter: int = 10 ,tol: float = 1e-3) -> Tuple[torch.Tensor, torch.Tensor, float, List[List[torch.Tensor]], List[List[torch.Tensor]]]:
     """
     Perform Bayesian estimation to recover the true mean, variance, and identify modified gradient scalars.
     
@@ -50,11 +50,11 @@ def Bayesian_estimate(g: List[List[torch.Tensor]], max_iter: int = 10,tol: float
             if flags_new[idx].item() == 1:
                 g_recovered[idx] = sample_scalar(g_flat[idx], 1, mu, sigma2)
         
-        # Update mu and sigma2 using only unmodified (or recovered) scalars
+        # Update mu and sigma2 using only unmodified or recovered scalars
         mu_new = sample_mean(g_recovered, flags_new)
         sigma2_new = sample_variance(g_recovered, flags_new, mu_new)
         
-        # Check for convergence (if changes in parameters are below tolerance, break)
+        # Check for convergence
         if (torch.abs(mu_new - mu) < tol and 
             torch.abs(sigma2_new - sigma2) < tol and 
             abs(pi_new - pi) < tol):
