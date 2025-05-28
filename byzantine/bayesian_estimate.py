@@ -1,162 +1,194 @@
-import torch
-import numpy as np
+from __future__ import annotations
+
+import math
 from typing import List, Tuple
 
-def Bayesian_estimate(g: List[List[torch.Tensor]], max_iter: int = 10 ,tol: float = 1e-3) -> Tuple[torch.Tensor, torch.Tensor, float, List[List[torch.Tensor]], List[List[torch.Tensor]]]:
-    """
-    Perform Bayesian estimation to recover the true mean, variance, and identify modified gradient scalars.
-    
-    Parameters:
-        g (List[List[torch.Tensor]]): A 2D list of gradient scalars.
-            - Outer list: clients (M clients)
-            - Inner list: gradient scalars from that client (P*K scalars)
-        max_iter (int): Maximum number of iterations.
-        tol (float): Convergence tolerance.
-    
-    Returns:
-        mu (torch.Tensor): Estimated true mean.
-        sigma2 (torch.Tensor): Estimated true variance.
-        pi (float): Estimated proportion of modified gradient scalars.
-        flags_list (List[List[torch.Tensor]]): 2D list of flags (0: unmodified, 1: modified) with same structure as g.
-        recovered_list (List[List[torch.Tensor]]): 2D list of recovered gradient scalars (modified ones replaced).
-    """
-    M = len(g)
-    if M == 0:
-        raise ValueError("Input list g is empty.")
-    P = len(g[0])
-    flattened_list = []
-    for client in g:
-        if len(client) != P:
-            raise ValueError("All inner lists must have the same length.")
-        flattened_list.extend(client)
-    g_flat = torch.stack(flattened_list)
+import torch
 
-    # Initialize parameters on the flattened tensor
-    flags = torch.zeros_like(g_flat)
-    mu = torch.mean(g_flat)
-    sigma2 = torch.var(g_flat, unbiased=True)
-    pi = 0.5
+
+def Bayesian_estimate(
+    g: List[List[torch.Tensor]],
+    *,
+    max_iter: int = 10,
+    tol: float = 1e-3,
+) -> Tuple[
+    torch.Tensor,                     # global posterior mean   (0-D tensor)
+    torch.Tensor,                     # global posterior var    (0-D tensor)
+    float,                            # global posterior pi     (float)
+    List[List[torch.Tensor]],         # nested flags            (0-D tensors)
+    List[torch.Tensor],               # [tensor(num_pert)]
+]:
+    # Unpack legacy payloads: a single 1-D tensor per client → list of 0-D tensors (one per perturbation).
+    if g and all(len(client) == 1 and client[0].ndim == 1 for client in g):
+        P = g[0][0].numel()
+        unpacked: List[List[torch.Tensor]] = []
+        for idx, client_vec in enumerate(g):
+            vec = client_vec[0]
+            if vec.numel() != P:
+                raise ValueError(
+                    f"Client {idx} sent vector length {vec.numel()} (expected {P})."
+                )
+            unpacked.append([vec[j].clone() for j in range(P)])  # 0-D each
+        g = unpacked
+
+    # Shape checks
+    if not g:
+        raise ValueError("Input list g is empty.")
+
+    M, P = len(g), len(g[0])
+    for i, client in enumerate(g):
+        if len(client) != P:
+            raise ValueError(f"Client {i} has {len(client)} directions; expected {P}.")
+        for j, t in enumerate(client):
+            if t.numel() != 1 or t.ndim != 0:
+                raise ValueError(
+                    f"Tensor at g[{i}][{j}] must be 0-D; got shape {tuple(t.shape)}."
+                )
+
+    # Stack into (M, P) matrix for vectorised maths
+    device, dtype = g[0][0].device, g[0][0].dtype
+    g_mat = torch.stack([torch.stack(client) for client in g]) # (M, P)
+    g_vec = g_mat.flatten()  # (M·P,)
+
+    flags = torch.zeros_like(g_vec) # corruption flags (0 = honest)
+    mu     = g_vec.mean()
+    sigma2 = (
+        g_vec.var(unbiased=True) if g_vec.numel() > 1
+        else torch.tensor(0.0, device=device, dtype=dtype)
+    )
+    pi = 0.5 # initialise to Beta(1,1) mean
 
     for _ in range(max_iter):
-        # Sample new pi based on current flags
-        pi_new = sample_pi(flags, alpha_prior=1.0, beta_prior=1.0)
-        
-        # Sample new flags for each scalar using the current mu, sigma2, and pi_new
-        flags_new = sample_flag(g_flat, mu, sigma2, pi_new)
-        
-        # Recover modified scalars by resampling them from N(mu, sigma2)
-        g_recovered = g_flat.clone()
-        for idx in range(g_flat.numel()):
-            if flags_new[idx].item() == 1:
-                g_recovered[idx] = sample_scalar(g_flat[idx], 1, mu, sigma2)
-        
-        # Update mu and sigma2 using only unmodified or recovered scalars
-        mu_new = sample_mean(g_recovered, flags_new)
-        sigma2_new = sample_variance(g_recovered, flags_new, mu_new)
-        
-        # Check for convergence
-        if (torch.abs(mu_new - mu) < tol and 
-            torch.abs(sigma2_new - sigma2) < tol and 
-            abs(pi_new - pi) < tol):
+        # sample π
+        pi_new = _sample_pi(flags)
+
+        # sample flags z_i
+        flags_new = _sample_flag(g_vec, mu, sigma2, pi_new)
+
+        # recover corrupted values
+        rec = g_vec.clone()
+        mask = flags_new.bool()
+        if mask.any():
+            rec[mask] = torch.normal(
+                mu,
+                torch.sqrt(sigma2).clamp_min(1e-12),
+                size=(int(mask.sum().item()),),
+                device=device,
+                dtype=dtype,
+            )
+
+        # sample μ and σ² from conjugate posteriors
+        mu_new     = _sample_mean(rec, flags_new)
+        sigma2_new = _sample_variance(rec, flags_new, mu_new)
+
+        # Convergence check
+        if (
+            torch.abs(mu_new - mu) < tol
+            and torch.abs(sigma2_new - sigma2) < tol
+            and abs(pi_new - pi) < tol
+        ):
             mu, sigma2, pi, flags = mu_new, sigma2_new, pi_new, flags_new
-            g_flat = g_recovered
+            g_vec = rec
             break
-        
-        # Otherwise, update parameters and continue iterating
+
         mu, sigma2, pi, flags = mu_new, sigma2_new, pi_new, flags_new
-        g_flat = g_recovered
+        g_vec = rec
 
-    # Unflatten the 1D recovered tensor and flags back to the original 2D structure
-    recovered_list = []
-    flags_list = []
-    for i in range(M):
-        # Get the slice corresponding to client i
-        client_slice = g_flat[i * P : (i + 1) * P]
-        client_flags = flags[i * P : (i + 1) * P]
-        # Convert each element to a scalar tensor and collect into a list
-        recovered_list.append([client_slice[j] for j in range(P)])
-        flags_list.append([client_flags[j] for j in range(P)])
-    
-    return mu, sigma2, pi, flags_list, recovered_list
+    # Reshape outputs to match caller expectations
+    flags_mat = flags.reshape(M, P)
+    flags_nested = [[flags_mat[i, j].unsqueeze(0) for j in range(P)] for i in range(M)]
 
-def sample_pi(flags: torch.Tensor, alpha_prior: float = 1.0, beta_prior: float = 1.0) -> float:
-    """
-    Sample the proportion (pi) of modified gradient scalars using a Beta posterior.
-    """
-    n = flags.numel()
-    sum_z = torch.sum(flags).item()
-    alpha_post = alpha_prior + sum_z
-    beta_post = beta_prior + n - sum_z
-    beta_dist = torch.distributions.Beta(alpha_post, beta_post)
-    return beta_dist.sample().item()
+    # Per-direction means of *recovered* scalars (needed downstream)
+    rec_mat = g_vec.reshape(M, P)
+    global_grad_scalar = [rec_mat.mean(dim=0)]
 
-def sample_flag(g: torch.Tensor, mu: torch.Tensor, sigma2: torch.Tensor, pi: float) -> torch.Tensor:
-    """
-    Sample modification flags for each gradient scalar.
-    """
-    norm_pdf = (1.0 / torch.sqrt(2 * torch.pi * sigma2)) * torch.exp(-((g - mu) ** 2) / (2 * sigma2))
-    p_modified = pi / (pi + (1 - pi) * norm_pdf)
-    flags = torch.bernoulli(p_modified)
-    return flags
+    # 0-D tensors for global posterior moments
+    mu_global     = mu.clone().detach()
+    sigma2_global = sigma2.clone().detach()
+    pi_global     = float(pi)
 
-def sample_scalar(g: torch.Tensor, flag: int, mu: torch.Tensor, sigma2: torch.Tensor) -> torch.Tensor:
-    """
-    Recover a gradient scalar. If unmodified (flag == 0), return the original value.
-    If modified (flag == 1), resample from N(mu, sigma2).
-    """
-    if flag == 0:
-        return g
+    return mu_global, sigma2_global, pi_global, flags_nested, global_grad_scalar
+
+
+def _sample_pi(flags: torch.Tensor, *, alpha0: float = 1.0, beta0: float = 1.0) -> float:
+    n_total = flags.numel()
+    n_one   = int(flags.sum().item())
+    a_post  = alpha0 + n_one
+    b_post  = beta0 + n_total - n_one
+    return torch.distributions.Beta(float(a_post), float(b_post)).sample().item()
+
+
+def _sample_flag(
+    g: torch.Tensor,
+    mu: torch.Tensor,
+    sigma2: torch.Tensor,
+    pi: float,
+    *,
+    outlier_pdf: float = 1e-3,
+) -> torch.Tensor:
+    std    = torch.sqrt(sigma2 + 1e-12)
+    pdf_in = (1.0 / (std * math.sqrt(2.0 * math.pi))) * torch.exp(
+        -(g - mu) ** 2 / (2.0 * sigma2 + 1e-12)
+    )
+    denom  = pi * outlier_pdf + (1.0 - pi) * pdf_in
+    p_z1   = torch.where(
+        denom == 0.0, torch.full_like(denom, 0.5),
+        (pi * outlier_pdf) / denom
+    )
+    return torch.bernoulli(torch.clamp(p_z1, 0.0, 1.0))
+
+
+def _sample_mean(
+    g: torch.Tensor,
+    z: torch.Tensor,
+    *,
+    tau0_sq: float = 1.0,
+) -> torch.Tensor:
+    honest = g[z == 0]
+    n      = honest.numel()
+    if n == 0:
+        return torch.normal(
+            torch.tensor(0.0, device=g.device, dtype=g.dtype),
+            math.sqrt(tau0_sq),
+        )
+
+    m_hat   = honest.mean()
+    var_hat = (
+        honest.var(unbiased=True) if n > 1
+        else torch.tensor(0.0, device=g.device, dtype=g.dtype)
+    )
+    post_var  = 1.0 / (1.0 / tau0_sq + n / (var_hat + 1e-12))
+    post_mean = post_var * (m_hat / (var_hat + 1e-12))
+    post_std  = torch.sqrt(post_var)
+    return torch.normal(post_mean, post_std)
+
+
+def _sample_variance(
+    g: torch.Tensor,
+    z: torch.Tensor,
+    mu: torch.Tensor,
+    *,
+    alpha0: float = 1.0,
+    beta0: float = 1.0,
+) -> torch.Tensor:
+    honest = g[z == 0]
+    n      = honest.numel()
+    if n == 0:
+        return g.var(unbiased=True)
+
+    sq_diff = (honest - mu) ** 2
+    a_post  = alpha0 + n / 2.0
+    b_post  = beta0  + 0.5 * sq_diff.sum()
+
+    if g.device.type == "mps":               # MPS Gamma has to run on CPU
+        concentration = torch.tensor(float(a_post), device="cpu", dtype=torch.float32)
+        rate          = torch.tensor(float(b_post.item()), device="cpu", dtype=torch.float32)
+        gamma_sample  = torch.distributions.Gamma(concentration, rate).sample()
+        gamma_sample  = gamma_sample.to(g.device, dtype=g.dtype)
     else:
-        return torch.normal(mu, torch.sqrt(sigma2))
+        gamma_sample = torch.distributions.Gamma(
+            torch.tensor(a_post, device=g.device, dtype=g.dtype),
+            torch.tensor(b_post, device=g.device, dtype=g.dtype),
+        ).sample()
 
-def sample_mean(g: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
-    """
-    Sample a new estimate for the true mean using only unmodified gradient scalars.
-    """
-    unmodified = g[flags == 0]
-    if unmodified.numel() > 0:
-        unmodified_np = unmodified.cpu().numpy()
-        mu_n_np = np.mean(unmodified_np)
-        if unmodified_np.size > 1:
-            var_np = np.var(unmodified_np, ddof=1)
-        else:
-            var_np = 0.0
-        sigma_n2 = var_np / unmodified_np.size
-        mu_n = torch.tensor(mu_n_np, dtype=g.dtype, device=g.device)
-        std = torch.sqrt(torch.tensor(sigma_n2, dtype=g.dtype, device=g.device))
-        if std < 1e-6:
-            return mu_n
-        return torch.normal(mu_n, std)
-    else:
-        return torch.mean(g)
-
-def sample_variance(g: torch.Tensor, flags: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
-    """
-    Sample a new estimate for the true variance using only unmodified gradient scalars.
-    
-    """
-    unmodified = g[flags == 0]
-    n_x = unmodified.numel()
-    if n_x == 0:
-        return torch.var(g, unbiased=True)
-    
-    alpha_prior = 1.0
-    beta_prior = 1.0
-    alpha_post = alpha_prior + n_x / 2.0
-    beta_post = beta_prior + 0.5 * torch.sum((unmodified - mu) ** 2)
-    
-    inv_gamma_dist = torch.distributions.InverseGamma(alpha_post, beta_post)
-    return inv_gamma_dist.sample()
-
-if __name__ == "__main__":
-    observed_g = [[torch.tensor(val) for val in [10.0]] for _ in range(10)]
-    observed_g[3][0] = torch.tensor(15.0)
-    observed_g[7][0] = torch.tensor(14.5)
-    
-    mu_est, sigma2_est, pi_est, flags_est, recovered_g = Bayesian_estimate(observed_g, max_iter=20, tol=1e-3)
-    
-    print("Estimated Mean (mu):", mu_est.item())
-    print("Estimated Variance (sigma^2):", sigma2_est.item())
-    print("Estimated Proportion Modified (pi):", pi_est)
-    print("Final Flags (per client):", flags_est)
-    print("Recovered Gradient Scalars (per client):", recovered_g)
+    return 1.0 / gamma_sample
